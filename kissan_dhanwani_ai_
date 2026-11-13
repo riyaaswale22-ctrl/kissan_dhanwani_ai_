@@ -1,0 +1,248 @@
+-- 1. User Roles (Single role per user: farmer, mechanic, vet, buyer, delivery)
+CREATE TABLE IF NOT EXISTS public.user_roles (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  role text NOT NULL CHECK (role IN ('farmer', 'mechanic', 'vet', 'buyer', 'delivery')),
+  created_at timestamptz DEFAULT now(),
+  CONSTRAINT user_roles_user_id_key UNIQUE (user_id)
+);
+ALTER TABLE public.user_roles ENABLE ROW LEVEL SECURITY;
+
+CREATE OR REPLACE FUNCTION public.has_role(_user_id uuid, _role text)
+RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.user_roles
+    WHERE user_id = _user_id AND role = _role
+  );
+$$;
+
+-- 2. User Profiles
+CREATE TABLE IF NOT EXISTS public.profiles (
+  id uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  full_name text,
+  phone text,
+  place text,
+  created_at timestamptz DEFAULT now()
+);
+ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Users read/write own profile" ON public.profiles
+  FOR ALL USING (auth.uid() = id);
+
+-- 3. Market Products (Organic Marketplace)
+CREATE TABLE IF NOT EXISTS public.products (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  farmer_id uuid NOT NULL,
+  title text NOT NULL,
+  category text NOT NULL,
+  price_per_kg numeric NOT NULL,
+  available_kg numeric NOT NULL,
+  photo_url text,
+  place text NOT NULL,
+  status text NOT NULL DEFAULT 'available',
+  created_at timestamptz DEFAULT now()
+);
+ALTER TABLE public.products ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Public read available products" ON public.products
+  FOR SELECT TO authenticated USING (status = 'available' OR auth.uid() = farmer_id);
+CREATE POLICY "Farmers can insert products" ON public.products
+  FOR INSERT TO authenticated WITH CHECK (auth.uid() = farmer_id AND public.has_role(auth.uid(), 'farmer'));
+
+-- 4. Orders & Delivery Flow
+CREATE TABLE IF NOT EXISTS public.orders (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  buyer_id uuid NOT NULL,
+  product_id uuid REFERENCES public.products(id),
+  farmer_id uuid NOT NULL,
+  delivery_id uuid,
+  quantity_kg numeric NOT NULL,
+  total_price numeric NOT NULL,
+  buyer_name text NOT NULL,
+  buyer_phone text NOT NULL,
+  delivery_address text NOT NULL,
+  payment_method text NOT NULL DEFAULT 'cash',
+  status text NOT NULL DEFAULT 'pending', -- pending, accepted, picked_up, delivered
+  created_at timestamptz DEFAULT now()
+);
+ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Order participants can view" ON public.orders
+  FOR SELECT TO authenticated USING (
+    auth.uid() = buyer_id OR auth.uid() = farmer_id OR auth.uid() = delivery_id OR status = 'pending'
+  );
+
+-- 5. Service Requests (Mechanic ₹120, Vet ₹100)
+CREATE TABLE IF NOT EXISTS public.service_requests (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  farmer_id uuid NOT NULL,
+  provider_id uuid,
+  category text NOT NULL CHECK (category IN ('mechanic', 'vet')),
+  problem_description text NOT NULL,
+  photo_url text,
+  farmer_name text NOT NULL,
+  farmer_phone text NOT NULL,
+  farmer_address text NOT NULL,
+  payment_method text NOT NULL,
+  fee numeric NOT NULL,
+  status text NOT NULL DEFAULT 'pending',
+  created_at timestamptz DEFAULT now()
+);
+ALTER TABLE public.service_requests ENABLE ROW LEVEL SECURITY;
+
+-- 6. Reminders (In-app reminders)
+CREATE TABLE IF NOT EXISTS public.reminders (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  title text NOT NULL,
+  due_date date,
+  kind text DEFAULT 'general',
+  done boolean DEFAULT false,
+  created_at timestamptz DEFAULT now()
+);
+ALTER TABLE public.reminders ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Users manage own reminders" ON public.reminders
+  FOR ALL TO authenticated USING (auth.uid() = user_id);
+import { createServerFn } from '@tanstack/react-start';
+import { z } from 'zod';
+import { chatWithGateway } from './ai-gateway.server';
+
+const AskSchema = z.object({
+  question: z.string().min(1),
+  language: z.enum(['mr', 'hi', 'en']),
+  location: z.string().optional(),
+  imageUrl: z.string().optional(),
+});
+
+export const askKisanAi = createServerFn({ method: 'POST' })
+  .validator((data: unknown) => AskSchema.parse(data))
+  .handler(async ({ data }) => {
+    const systemPrompt = `You are Kissan Dhanwan AI, an expert agricultural engineer, veterinary assistant, and plant pathologist.
+The user is an Indian farmer. Respond in ${data.language === 'mr' ? 'Marathi' : data.language === 'hi' ? 'Hindi' : 'English'}.
+Help diagnose engine issues (tractors, harvesters), crop diseases, animal sickness, or verify if medicine is real or fake.
+Always end your reply with a clear classification line:
+SERIOUS: yes (if a mechanic or doctor visit is required) or SERIOUS: no (if simple self-repair or homemade remedy works).`;
+
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      {
+        role: 'user',
+        content: data.imageUrl
+          ? [
+              { type: 'text', text: `${data.question}\nFarmer location: ${data.location || 'Maharashtra'}` },
+              { type: 'image_url', image_url: { url: data.imageUrl } }
+            ]
+          : `${data.question}\nFarmer location: ${data.location || 'Maharashtra'}`,
+      },
+    ];
+
+    const response = await chatWithGateway(messages);
+    const seriousMatch = response.match(/SERIOUS:\s*(yes|no)/i);
+    const serious = seriousMatch ? seriousMatch[1].toLowerCase() === 'yes' : false;
+    const cleanText = response.replace(/SERIOUS:\s*(yes|no)/i, '').trim();
+
+    return { text: cleanText, serious };
+  });
+import { createServerFn } from '@tanstack/react-start';
+import { z } from 'zod';
+import { chatWithGateway } from './ai-gateway.server';
+
+export const estimateProductPrice = createServerFn({ method: 'POST' })
+  .validator((data: { productName: string; place: string; photoBase64?: string }) => data)
+  .handler(async ({ data }) => {
+    const prompt = `Analyze this farm produce: "${data.productName}" from "${data.place}".
+Return strict format:
+INSTANT: <number in INR/kg>
+PREMIUM: <number in INR/kg for direct city delivery>
+QUALITY: <1 sentence quality assessment>
+TREND: <UP | DOWN | STABLE>
+STORAGE: <STORE | SELL_NOW> (advice on solar cold-storage)`;
+
+    const raw = await chatWithGateway([
+      { role: 'user', content: prompt }
+    ]);
+
+    const instant = Number(raw.match(/INSTANT:\s*(\d+)/i)?.[1] || 25);
+    const premium = Math.max(Number(raw.match(/PREMIUM:\s*(\d+)/i)?.[1] || 32), Math.round(instant * 1.2));
+    const trend = (raw.match(/TREND:\s*(UP|DOWN|STABLE)/i)?.[1] || 'STABLE').toUpperCase();
+
+    return {
+      price: instant,
+      instantPrice: instant,
+      premiumPrice: premium,
+      trend,
+      quality: raw.match(/QUALITY:\s*(.+)/i)?.[1] || 'Grade A Fresh Produce',
+      note: 'AI estimated based on local mandi & direct consumer demand'
+    };
+  });
+import { Link, useRouterState } from '@tanstack/react-router';
+import { Home, ShoppingBag, Store, UserCheck, Landmark } from 'lucide-react';
+
+export function AppNav() {
+  const router = useRouterState();
+  const currentPath = router.location.pathname;
+
+  const links = [
+    { to: '/', label: 'होम / Home', icon: Home },
+    { to: '/schemes', label: 'योजना / Schemes', icon: Landmark },
+    { to: '/market', label: 'खरेदी / Buy', icon: ShoppingBag },
+    { to: '/sell', label: 'विक्री / Sell', icon: Store },
+    { to: '/switch-role', label: 'काम बदला / Role', icon: UserCheck },
+  ];
+
+  return (
+    <nav className="fixed bottom-0 left-0 right-0 z-50 bg-background/95 backdrop-blur border-t border-border shadow-lg">
+      <div className="max-w-md mx-auto flex items-center justify-around py-2 px-1">
+        {links.map((link) => {
+          const Icon = link.icon;
+          const active = currentPath === link.to;
+          return (
+            <Link
+              key={link.to}
+              to={link.to}
+              className={`flex flex-col items-center py-1 px-2 text-xs font-medium rounded-lg transition-colors ${
+                active ? 'text-primary font-semibold' : 'text-muted-foreground hover:text-foreground'
+              }`}
+            >
+              <Icon className={`w-5 h-5 mb-1 ${active ? 'stroke-[2.5]' : 'stroke-[1.75]'}`} />
+              <span className="text-[10px] leading-tight text-center">{link.label}</span>
+            </Link>
+          );
+        })}
+      </div>
+    </nav>
+  );
+}
+import { Outlet, HeadContent, Scripts } from '@tanstack/react-router';
+import { AppNav } from '@/components/AppNav';
+import { Toaster } from '@/components/ui/sonner';
+
+export const Route = createRootRoute({
+  component: RootComponent,
+});
+
+function RootComponent() {
+  return (
+    <html lang="mr">
+      <head>
+        <HeadContent />
+      </head>
+      <body className="min-h-screen bg-background text-foreground pb-20">
+        <header className="sticky top-0 z-40 bg-primary/95 text-primary-foreground py-3 px-4 shadow">
+          <h1 className="text-lg font-bold">🌾 Kissan Dhanwan AI (किसान धनवन् AI)</h1>
+        </header>
+
+        <main className="max-w-md mx-auto p-4">
+          <Outlet />
+        </main>
+
+        <AppNav />
+        <Toaster />
+
+        {/* Subtly placed founder credit at the very bottom */}
+        <footer className="text-center text-[10px] text-muted-foreground/60 py-2">
+          Designed for Indian Agriculture • Founder: Arjun Ajit Aswale
+        </footer>
+
+        <Scripts />
+      </body>
+    </html>
+  );
+}
