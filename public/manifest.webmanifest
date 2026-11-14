@@ -1,0 +1,17 @@
+{
+  "name": "Kissan Dhanwan AI",
+  "short_name": "KissanAI",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f6f5ee",
+  "theme_color": "#2e6f3d",
+  "description": "AI-powered agriculture and rural commerce app for Indian farmers and partners.",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
